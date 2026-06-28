@@ -1,6 +1,6 @@
 # Alfano 6 — Bluetooth Protocol Specification (Reverse-Engineered)
 
-**Status:** Working draft v0.3 · Reverse-engineered from three HCI snoop captures (full memory dump + single-session download + full multi-session driven dump) for interoperability with owned hardware (LapWing / PerchWerks).
+**Status:** Working draft v0.4 · Reverse-engineered from three HCI snoop captures + the official app's CSV/EEPROM session export (used as a known-plaintext key) for interoperability with owned hardware (LapWing / PerchWerks).
 **Device:** Alfano 6 (kart lap timer / data logger), firmware shown as `1T`, "Professional" mode.
 **Transport:** Bluetooth **Classic** (BR/EDR) — **SPP / RFCOMM**. *Not* BLE. Web Bluetooth cannot reach this device; see [§9 Implementation](#9-implementation-notes).
 
@@ -244,13 +244,50 @@ A client that only does phase 1 gets the lap list and summary stats but **no det
 
 **Scope warning:** a full dump spans **all stored sessions across all tracks**, not one session — the driven capture contained `SHORT OKC`, `LONG OKC`, *and* `ORLANDO KART` headers. To isolate a single session, filter header records by track string + contiguous stamp/timestamp range before stitching samples.
 
+### 7.3 Decoded data formats — CONFIRMED via app CSV export ✅
+
+Cross-referenced against the official app's session export (a ZIP of per-lap CSVs + EEPROM page dumps) for `SN9363 / *P* SHORT OKC / Dame / 6 laps`. The `SN` = device serial **9363** = `0x2493` = the `93 24` marker seen inside records.
+
+**GPS encoding (corrects v0.3):** latitude and longitude are **degrees × 1e6** (NOT ×1e7), each a 32-bit LE integer, **lat then lon, adjacent**. Real values cluster tightly at OKC start/finish (lat 28.412728, lon −81.379679, from `projection_orthogonale2023.csv`). The recurring `26 FB` bytes were just the longitude's near-constant high bytes.
+
+**Phase-2 per-sample telemetry record = 36 bytes, logged at 10 Hz**, stored back-to-back in the bulk sample stream. All 16 channels matched to CSV columns:
+
+| Offset | Size | Field | Encoding / units |
+|---|---|---|---|
+| 0 | 4 | Latitude | i32 LE, deg × 1e6 |
+| 4 | 4 | Longitude | i32 LE, deg × 1e6 |
+| 8 | 2 | Altitude | u16 LE (≈ m, zero-point TBD) |
+| 10 | 2 | RPM (engine, main) | u16 LE |
+| 12 | 2 | Speed (GPS) | u16 LE, **km/h × 10** |
+| 14 | 2 | T1 (temp ch 1) | u16 LE (0 = unconnected) |
+| 16 | 2 | T2 (temp ch 2) | u16 LE |
+| 18 | 2 | Gf.X (lateral G) | u16 LE, **g × 1000**, ~1000 baseline 🟡 |
+| 20 | 2 | Gf.Y (longitudinal G) | u16 LE, **g × 1000**, ~1000 baseline 🟡 |
+| 22 | 2 | Orientation (heading) | u16 LE, **deg × 100** |
+| 24 | 2 | Speed rear (wheel sensor) | u16 LE (0 = unconnected) |
+| 26 | 2 | RPM 1 (20 Hz sub-sample) | u16 LE |
+| 28 | 2 | RPM 2 (50 Hz) | u16 LE |
+| 30 | 2 | RPM 3 (50 Hz) | u16 LE |
+| 32 | 2 | RPM 4 (50 Hz) | u16 LE |
+| 34 | 2 | RPM 5 (50 Hz) | u16 LE |
+
+Each 10 Hz record embeds 5 higher-rate RPM sub-samples (RPM logged at 50 Hz, GPS + everything else at 10 Hz). A ~56 s lap ≈ 560 records ≈ 20 KB.
+
+**Session summary / lap times** (`SN9363_….csv`): lap times are **milliseconds** (56540, 56160, 56310, 56420, 56620, 56350 → lap 2 = 56.160 s = best). Each lap has **6 sector splits** ("partiels") summing to the lap time. Per-lap summary channels: Min/Max RPM, Min/Max GPS speed, T1–T4, Vbattery, max EGT, Hdop. `Vbattery ≈ 3620` matches the header field at record offset ~9 ⇒ that field is battery voltage (scale TBD, ~×100).
+
+**Lap files:** a "6 lap" session exports **7** `LAP_n` CSVs — **no outlap**, but the in/pit lap is included (LAP_7 shorter). Map lap files to timed laps accordingly.
+
+**EEPROM pages ↔ READ_PAGE:** export's `EEPROM_PAGE_14.dat` / `EEPROM_PAGE_16.dat` (128 B) correspond directly to `READ_PAGE 0x0E` / `0x10` (§4.1) — confirms the page-read path end-to-end.
+
+**Identifiers / other export files:** app = "Android ADA CLASSIQUE 5.4.6". ZIP also holds `PARAMETRE….dat` (config), `temps_moteur.csv` (engine hour-meters), `lap_theorique.csv` (theoretical best lap), `projection_orthogonale2023.csv` (GPS→track-map projection reference: reference lat/lon, orientation, line coefficients).
+
 ---
 
 ## 8. Known unknowns / next captures
 
 To finish the spec, capture in this order and re-run the parser:
 
-1. **CSV export of a known session + that session's raw dump** — *now the single most valuable input.* A real 6-lap driven session has been captured (full dump, both phases), and the sample stream clearly contains real structured telemetry — but the **per-sample field encoding is NOT yet decoded.** Inferring fields (GPS, lap times, RPM) from the binary alone does **not** converge: numeric-range guessing produces false positives (e.g. values landing in a plausible GPS-latitude range were confirmed bogus once their spatial span was sanity-checked). The reliable method is **known-plaintext alignment** — take the CSV the official app exports for a specific session, line its decoded values (lap times, GPS lat/lon, RPM, channels) against the raw bytes of that same session's records, and read the offsets/scales off directly. Until then, treat all sample-level field offsets as ❓.
+1. **~~CSV export of a known session~~ — DONE (v0.4).** The per-sample 36-byte record (§7.3) is fully decoded against the app CSV. Remaining *minor* unknowns, none blocking a working decoder: (a) Gf.X/Gf.Y exact zero-point and sign convention (values sit ~1000 ⇒ likely `(raw−1000)/1000` g, unverified); (b) Altitude units/offset; (c) Vbattery scale; (d) the byte offsets of lap time + the 6 sector splits *inside* the `80FFFEFD` header records (the summary CSV gives the values; alignment not yet done); (e) how phase-2 sample addresses map to individual laps/segments (likely via pointers in the segment headers).
 2. **Engine running + poll `0x36` repeatedly** — the official apps have **no live view**, so a live stream may not exist. Test it directly: with the engine running, send `STATUS` (`0x36`) on a loop and watch whether the 16-byte response changes. Changing values ⇒ a live channel LapWing can use for a real-time overlay. Static values (or no response to repeated polls) ⇒ accept that Alfano-over-BT is **session-download only**.
 3. **Change a setting in the app (driver name, track, sample rate)** — reveals **write** opcodes (none seen in this read-only download capture).
 4. **A second, longer session** — confirm the `0x2B` page-numbering scheme and the sweep stop condition.
